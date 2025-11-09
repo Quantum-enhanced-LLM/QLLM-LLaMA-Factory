@@ -26,7 +26,8 @@ from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
-
+import os
+from dotenv import load_dotenv
 
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
-
+load_dotenv()
 
 def run_sft(
     model_args: "ModelArguments",
@@ -77,6 +78,22 @@ def run_sft(
     gen_kwargs = generating_args.to_dict(obey_generation_config=True)
     gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+
+    callbacks = callbacks if callbacks is not None else []
+
+    if int(os.getenv('QPEFT_LOG_CALLBACK', 0)):
+        if finetuning_args.finetuning_type == 'lora' and finetuning_args.use_qpeft:
+            if finetuning_args.qpeft_arch in ['ABC', 'BC', 'C']:
+                from peft.tuners.lora import QPeftLogCallback
+                callbacks.append(QPeftLogCallback(finetuning_args.qpeft_arch))
+                print('Registered QPeftLogCallback')
+
+    if int(os.getenv('QPEFT_LOG_FORWARD_CALLBACK', 0)):
+        if finetuning_args.finetuning_type == 'lora' and finetuning_args.use_qpeft:
+            if finetuning_args.qpeft_arch in ['ABC', 'BC', 'C']:
+                from peft.tuners.lora import QPeftLogForwardCallback
+                callbacks.append(QPeftLogForwardCallback(finetuning_args.qpeft_arch))
+                print('Registered QPeftLogForwardCallback')
 
     # Initialize our Trainer
     trainer = CustomSeq2SeqTrainer(

@@ -15,6 +15,7 @@
 import re
 from typing import TYPE_CHECKING
 
+import quanta.peft_model
 import torch
 from peft import LoraConfig, LoraModel, PeftModel, TaskType, get_peft_model
 from transformers.integrations import is_deepspeed_zero3_enabled
@@ -146,6 +147,7 @@ def _setup_lora_tuning(
     is_trainable: bool,
     cast_trainable_params_to_fp32: bool,
 ) -> "PeftModel":
+
     if is_trainable:
         logger.info_rank0("Fine-tuning method: {}".format("DoRA" if finetuning_args.use_dora else "LoRA"))
 
@@ -179,9 +181,37 @@ def _setup_lora_tuning(
             "token": model_args.hf_hub_token,
         }
 
-        for adapter in adapter_to_merge:
-            model: LoraModel = PeftModel.from_pretrained(model, adapter, **init_kwargs)
-            model = model.merge_and_unload()
+        for adapter in adapter_to_merge:            
+            if finetuning_args.use_quanta:
+                from quanta import QuanTAConfig, get_peft_model as get_quanta_model
+                # from safetensors.torch import load_file
+                # resume model                
+                peft_config = QuanTAConfig(d=finetuning_args.lora_rank, 
+                                        quanta_dropout=finetuning_args.quanta_dropout, 
+                                        merge_weights=finetuning_args.quanta_merge_weights,
+                                        fan_in_fan_out=finetuning_args.quanta_fan_in_fan_out,
+                                        per_dim_features=finetuning_args.quanta_per_dim_features,
+                                        per_dim_features2=finetuning_args.quanta_per_dim_features2, 
+                                        target_modules=finetuning_args.lora_target,
+                                        initialize_mode=finetuning_args.quanta_initialize_mode,  # set to default
+                                        bias=finetuning_args.quanta_bias,  # set to default
+                                        task_type="CAUSAL_LM")
+                
+                model = get_quanta_model(model, peft_config)
+                model.bfloat16()
+                model_state_dict = torch.load(adapter + "/pytorch_model.bin")
+                model.load_state_dict(model_state_dict, strict=False)
+                
+                print("Quanta weights loaded")
+            else:
+                model: LoraModel = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+                
+                if finetuning_args.use_qpeft == True:
+                    # Use QPeFT model
+                    print("QPeFT weights loaded")
+                    model.bfloat16()
+                else:
+                    model = model.merge_and_unload()
 
         if len(adapter_to_merge) > 0:
             logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
@@ -231,7 +261,18 @@ def _setup_lora_tuning(
             "use_rslora": finetuning_args.use_rslora,
             "use_dora": finetuning_args.use_dora,
             "modules_to_save": finetuning_args.additional_target,
+            "use_qpeft": finetuning_args.use_qpeft
         }
+
+        # Additional support of QPeFT
+        if finetuning_args.use_qpeft:
+            peft_kwargs.update(
+                {
+                    "qpeft_arch": finetuning_args.qpeft_arch,
+                    "qpeft_qcircuit_layers": finetuning_args.qpeft_qcircuit_layers,
+                    "qpeft_classical_layers": finetuning_args.qpeft_classical_layers,
+                }
+            )
 
         if model_args.use_unsloth:
             model = get_unsloth_peft_model(model, model_args, peft_kwargs)
@@ -244,12 +285,26 @@ def _setup_lora_tuning(
                     logger.info_rank0(f"Using PiSSA initialization with FSVD steps {finetuning_args.pissa_iter}.")
                     peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
 
-            lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                **peft_kwargs,
-            )
-            model = get_peft_model(model, lora_config)
+            if finetuning_args.use_quanta:    
+                from quanta import QuanTAConfig, get_peft_model as get_quanta_model   
+                peft_config = QuanTAConfig(d=finetuning_args.lora_rank, 
+                                        quanta_dropout=finetuning_args.quanta_dropout, 
+                                        merge_weights=finetuning_args.quanta_merge_weights,
+                                        fan_in_fan_out=finetuning_args.quanta_fan_in_fan_out,
+                                        per_dim_features=finetuning_args.quanta_per_dim_features,
+                                        per_dim_features2=finetuning_args.quanta_per_dim_features2, 
+                                        target_modules=target_modules,
+                                        initialize_mode=finetuning_args.quanta_initialize_mode,  # set to default
+                                        bias=finetuning_args.quanta_bias,  # set to default
+                                        task_type="CAUSAL_LM")        
+                model = get_quanta_model(model, peft_config)
+            else:
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    inference_mode=False,
+                    **peft_kwargs,
+                )
+                model = get_peft_model(model, lora_config)
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):
